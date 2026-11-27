@@ -519,14 +519,91 @@ quizInstanceId、taskId、nodeId、questionId、questionVersion、optionOrder、
 
 以下为一期拟采用的开发基线。仓库当前交付需求文档和素材，版本号用于立项与联调，实际部署版本由首次发布记录确认。
 
-| 层级 | 采用方案与版本 | 选型依据及代价 |
-| --- | --- | --- |
-| 小程序 | 微信原生 WXML/WXSS、Canvas 2D，基础库 3.6.0 作为最低真机验收目标，TypeScript 5.9.3 编译为 JS | 一期只交付微信端，地图单独绘制，线索、剧情、答题使用原生组件。相较 Taro 多端方案，可直接调试触点换算、转屏和分享；以后扩端需重写视图。 |
-| 业务服务 | Node.js 24.22.3 LTS、TypeScript 5.9.3，单体 HTTPS JSON API v1 | 寻宝、资产、题库、猫圈分模块部署在同一服务中。相较独立云函数，扣次与结算可共用数据库连接池和事务，代价是团队需管理服务部署、监控和容量。 |
-| 数据与图片 | **MySQL 8.0**（InnoDB）；猫圈图片与海报使用对象存储，数据库保存对象键及审核状态 | 首次探索通过 InnoDB 事务同步更新次数、道具库存与任务状态；结算时按主键锁定任务行，以任务 ID 作为结算流水的唯一键，保证重复领取返回同一凭证；相较文档库，团队需维护表迁移和索引。对象存储采用托管服务，按部署环境选择地域。 |
+### 16.1 前端（微信小程序端）
 
+一期采用 **UniApp（Vue 3 + Vite）** 开发微信小程序，后续可复用 Vue 组件开发猫圈动态的 H5 分享页。
+
+- **业务界面**沿用 Vue 3 生态，配合 uView Plus / uni-ui 实现表单、图片上传、瀑布流、弹窗、空状态和加载反馈，减少基础组件的开发工作。
+- **猫咪寻宝**在小程序 Canvas 中接入 PixiJS，绘制 10 张 2D 寻宝地图，处理触点与地图坐标的换算，播放交互动画和寻宝特效。玩家点击探索后，客户端提交位置，根据服务端判定展示结果。地图触控与转屏以微信基础库 3.6.0 为最低真机验收目标。
+
+### 16.2 后端
+
+**技术栈**采用 Node.js 24.22.3 LTS、NestJS、TypeScript 5.9.3、MySQL 8.0 和 Redis。寻宝、盲盒、任务与猫圈按 NestJS 模块组织，通过 HTTPS JSON API v1 提供服务。
+
+- **接口与维护**使用 TypeScript 定义请求和响应类型，通过 NestJS 的 Swagger 集成生成接口文档，供前后端联调及后续迭代使用。
+- **ORM** 推荐 Prisma，通过 Schema 描述数据模型并生成类型化的 TypeScript 客户端。TypeORM 为备选。
+- **持久化**使用 MySQL 8.0（InnoDB）保存用户数据、猫咪图鉴、盲盒收集记录、猫圈动态、点赞、评论、寻宝存档和任务。猫圈图片与海报存入对象存储，数据库记录对象键和审核状态。
+- **Redis 缓存与计数**用于缓存猫咪图鉴、首页 Tab 配置和盲盒基础配置，并维护点赞数与浏览量。
+- **Redis 限流与并发控制**对发动态、上传图片和抽盲盒分别限流。盲盒抽奖使用分布式锁协调并发请求，库存扣减与奖励入账在 MySQL 事务中完成，防止超发。
+- **游戏判定**由后端计算地图可达性、寻宝结果、道具消耗、探索进度和盲盒抽取结果。后端按配置执行概率规则，校验存档版本与解锁条件，防止篡改客户端数据作弊。
 
 版本依据见 [Node.js 24 发布档案](https://nodejs.org/en/download/archive/v24.22.3)、[MySQL 8.0 参考手册](https://dev.mysql.com/doc/refman/8.0/en/)和 [TypeScript 5.9.3 发布记录](https://github.com/microsoft/TypeScript/releases/tag/v5.9.3)。
+
+#### 部署（腾讯云 CVM）
+
+- **服务容器化**。使用 Docker 构建 NestJS 服务镜像，在腾讯云 CVM 上通过 Docker Compose 统一管理 NestJS 与 Nginx 容器。部署配置随代码维护，迁移主机时可复用。
+- **域名与证书**。将 API 域名解析到 CVM 公网 IP，为该域名配置腾讯云 SSL 证书。证书和私钥由部署环境以只读方式挂载到 Nginx 容器。
+- **反向代理与 HTTPS**。Nginx 在 443 端口接收小程序的 HTTPS 请求，完成 TLS 终止后，通过 Compose 内部网络将请求转发给 NestJS。
+
+### 16.3 前后端与部署目录架构图
+
+以下为一期建议目录。微信小程序通过微信平台发布，使用 API 域名访问 CVM 上的 Nginx，由 Nginx 转发至 NestJS API v1。
+
+```text
+AIToPetCatDaily/
+├── PRD.md
+├── deploy/                           # 腾讯云 CVM 部署配置
+│   ├── compose.yaml                  # 编排 NestJS 与 Nginx 容器
+│   └── nginx/
+│       └── api.conf                  # API 域名、HTTPS 证书路径与反向代理
+├── petcatdaily-frontend/                         # UniApp 微信小程序
+│   ├── package.json
+│   ├── vite.config.ts
+│   └── src/
+│       ├── main.ts                   # Vue 3 应用入口
+│       ├── App.vue                   # 应用生命周期与全局样式
+│       ├── manifest.json             # 小程序平台与构建配置
+│       ├── pages.json                # 页面路由与 Tab 配置
+│       ├── pages/
+│       │   ├── home/                 # 首页与猫咪唤醒入口
+│       │   ├── treasure/             # 横竖屏寻宝、场景选择、答题与领奖
+│       │   ├── collection/           # 盲盒屋子、图鉴与猫咪详情
+│       │   ├── profile/              # 个人中心
+│       │   ├── share/                # 分享与助力落地页
+│       │   └── community/            # 猫圈动态列表、发布、详情与互动
+│       ├── game/treasure/            # PixiJS 地图渲染、坐标换算与动画
+│       ├── components/               # 跨页面复用的组件
+│       ├── api/                      # 请求封装与各业务接口
+│       ├── stores/                   # 登录态与跨页面展示状态
+│       └── static/                   # 随包发布的图标与图片
+└── petcatdaily-server/               # NestJS 服务
+    ├── Dockerfile                    # 构建 NestJS 服务镜像
+    ├── package.json
+    ├── prisma/
+    │   ├── schema.prisma             # MySQL 数据模型与约束
+    │   └── migrations/               # 数据库迁移记录
+    └── src/
+        ├── main.ts                   # HTTP 启动、API 版本与 Swagger
+        ├── app.module.ts             # 注册模块
+        ├── common/                   # 通用守卫、异常处理与参数校验
+        ├── infrastructure/
+        │   ├── database/             # Prisma 客户端与连接管理
+        │   ├── redis/                # 缓存、计数、限流与锁
+        │   └── storage/              # 图片与海报的对象存储
+        └── modules/
+            ├── auth/                 # 微信登录与身份校验
+            ├── users/                # 用户资料
+            ├── cats/                 # 猫咪图鉴与详情
+            ├── treasure/             # 地图、节点、判题、存档与结算
+            ├── blind-box/            # 抽奖概率、库存与收集记录
+            ├── tasks/                # 任务进度与完成条件
+            ├── share/                # 分享记录与助力校验
+            └── community/            # 动态、图片审核状态、点赞与评论
+```
+
+以寻宝为例，`frontend/src/game/treasure/` 将玩家触点换算为地图坐标，寻宝页面通过 `frontend/src/api/` 提交探索请求。`petcatdaily-server/src/modules/treasure/` 校验位置、道具和任务进度，在 MySQL 事务中保存结果，再由小程序播放对应动画。题库答案与奖励概率仅保存在服务端。
+
+### 16.4 寻宝接口与联调验收
 
 **寻宝接口与事务边界**
 
